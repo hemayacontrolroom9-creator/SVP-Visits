@@ -38,24 +38,18 @@ export class PaginationDto {
   }
 }
 
+// Matches frontend PaginatedResponse<T> interface exactly
 export interface PaginatedResult<T> {
-  data: T[];
-  meta: {
-    total: number;
-    page: number;
-    limit: number;
-    totalPages: number;
-    hasNextPage: boolean;
-    hasPrevPage: boolean;
-  };
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
 }
 
-export function paginate<T>(data: T[], total: number, dto: PaginationDto): PaginatedResult<T> {
+export function paginate<T>(items: T[], total: number, dto: PaginationDto): PaginatedResult<T> {
   const page = dto.page || 1;
   const limit = dto.limit || 20;
   const totalPages = Math.ceil(total / limit);
-  return {
-    data,
-    meta: { total, page, limit, totalPages, hasNextPage: page < totalPages, hasPrevPage: page > 1 },
-  };
+  return { items, total, page, limit, totalPages };
 }

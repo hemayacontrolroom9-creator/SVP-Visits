@@ -7,7 +7,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
 import { WinstonModule } from 'nest-winston';
 import { CacheModule } from '@nestjs/cache-manager';
-import { redisStore } from 'cache-manager-redis-yet';
+import { redisStore } from 'cache-manager-ioredis-yet';
 import * as winston from 'winston';
 import 'winston-loki';
 
@@ -43,8 +43,9 @@ import { LoggerMiddleware } from './common/middleware/logger.middleware';
 
     // ── Logging ───────────────────────────────────────────
     WinstonModule.forRootAsync({
-      useFactory: (config: ConfigService) => ({
-        transports: [
+      useFactory: (config: ConfigService) => {
+        const lokiHost = config.get<string>('LOKI_HOST', '');
+        const transports: winston.transport[] = [
           new winston.transports.Console({
             format: winston.format.combine(
               winston.format.timestamp(),
@@ -54,21 +55,24 @@ import { LoggerMiddleware } from './common/middleware/logger.middleware';
               }),
             ),
           }),
-          ...(config.get('LOG_LEVEL') !== 'debug'
-            ? [
-                new (winston.transports as any).LokiTransport({
-                  host: config.get('LOKI_HOST', 'http://loki:3100'),
-                  labels: { app: 'supervisor-visit-backend' },
-                  json: true,
-                  format: winston.format.json(),
-                  replaceTimestamp: true,
-                  onConnectionError: (err) => console.error('Loki error:', err),
-                }),
-              ]
-            : []),
-        ],
-        level: config.get('LOG_LEVEL', 'info'),
-      }),
+        ];
+
+        // Only add Loki transport if host is configured
+        if (lokiHost && config.get('NODE_ENV') !== 'test') {
+          transports.push(
+            new (winston.transports as any).LokiTransport({
+              host: lokiHost,
+              labels: { app: 'hemaya-vms-backend', env: config.get('NODE_ENV', 'development') },
+              json: true,
+              format: winston.format.json(),
+              replaceTimestamp: true,
+              onConnectionError: (err: Error) => console.error('Loki connection error:', err.message),
+            }),
+          );
+        }
+
+        return { transports, level: config.get('LOG_LEVEL', 'info') };
+      },
       inject: [ConfigService],
     }),
 
@@ -80,34 +84,40 @@ import { LoggerMiddleware } from './common/middleware/logger.middleware';
         host: config.get('DB_HOST', 'localhost'),
         port: config.get<number>('DB_PORT', 5432),
         username: config.get('DB_USERNAME', 'postgres'),
-        password: config.get('DB_PASSWORD'),
+        password: config.get<string>('DB_PASSWORD'),
         database: config.get('DB_NAME', 'supervisor_visits'),
         ssl: config.get('DB_SSL', 'false') === 'true' ? { rejectUnauthorized: false } : false,
         entities: [__dirname + '/**/*.entity{.ts,.js}'],
         migrations: [__dirname + '/database/migrations/*{.ts,.js}'],
         synchronize: false,
-        logging: config.get('NODE_ENV') === 'development',
+        logging: config.get('NODE_ENV') === 'development' ? ['error', 'warn'] : ['error'],
+        retryAttempts: 10,
+        retryDelay: 3000,
         extra: {
           max: config.get<number>('DB_POOL_MAX', 20),
           min: config.get<number>('DB_POOL_MIN', 2),
           idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 5000,
         },
       }),
     }),
 
-    // ── Cache (Redis) ─────────────────────────────────────
+    // ── Cache (Redis via ioredis) ─────────────────────────
     CacheModule.registerAsync({
       isGlobal: true,
       inject: [ConfigService],
-      useFactory: async (config: ConfigService) => ({
-        store: redisStore,
-        socket: {
+      useFactory: async (config: ConfigService) => {
+        const password = config.get<string>('REDIS_PASSWORD', '');
+        return {
+          store: redisStore,
           host: config.get('REDIS_HOST', 'localhost'),
           port: config.get<number>('REDIS_PORT', 6379),
-        },
-        password: config.get('REDIS_PASSWORD'),
-        ttl: config.get<number>('REDIS_TTL', 3600) * 1000,
-      }),
+          ...(password ? { password } : {}),
+          db: config.get<number>('REDIS_DB', 0),
+          ttl: config.get<number>('REDIS_TTL', 3600),
+          retryStrategy: (times: number) => Math.min(times * 100, 3000),
+        };
+      },
     }),
 
     // ── Rate Limiting ─────────────────────────────────────
@@ -118,6 +128,11 @@ import { LoggerMiddleware } from './common/middleware/logger.middleware';
           name: 'default',
           ttl: config.get<number>('THROTTLE_TTL', 60) * 1000,
           limit: config.get<number>('THROTTLE_LIMIT', 100),
+        },
+        {
+          name: 'auth',
+          ttl: 60 * 1000,
+          limit: config.get<number>('THROTTLE_LOGIN_LIMIT', 5),
         },
       ],
     }),
